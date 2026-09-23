@@ -1,8 +1,8 @@
 # 137 - Configurable upstream connect timeout
 
 Add a `connectTimeout` key to `ClusterDefinition` that governs how long the proxy waits for the
-TCP connect to an upstream broker to complete, defaulting to 10 seconds in place of Netty's
-current 30-second default.
+TCP connect to an upstream broker to complete. Netty's existing 30-second default is retained when
+the key is left unset; setting it changes behaviour only for the clusters that opt in.
 
 ## Current situation
 
@@ -111,8 +111,8 @@ distinction is easy to miss because Kafka's `request.timeout.ms` also defaults
 to 30000, putting the two timers in a race at today's default — one observed run
 had the proxy's exception fire 9ms ahead of the client's, though that is a
 single observation well inside ordinary scheduling jitter and not a claim that
-the proxy reliably wins. A materially lower default removes the race rather than
-resolving it in either direction.
+the proxy reliably wins. An operator who configures a materially lower `connectTimeout` removes the
+race rather than resolving it in either direction.
 
 Per-broker connections have it worse, because there is nothing to fall back to.
 That address comes from cluster metadata via `BrokerEndpointBinding`, not from a
@@ -124,6 +124,11 @@ not fail the same way — it resends on `request.timeout.ms` with retries
 effectively unbounded rather than raising that exception — so the "budget
 exhausted, bootstrap fails" outcome is specific to what was tested and should
 not be assumed to hold for producers or consumers.
+
+The same knob serves the opposite need too: operators running test environments or connecting over
+high-latency links have hit the reverse problem, where 30 seconds is too *short*, and today have no
+way to raise it. `connectTimeout` serves both directions from a single value — shortening the wait
+against a blackholed address, or lengthening it where 30 seconds is not enough.
 
 ## Proposal
 
@@ -141,7 +146,7 @@ clusterDefinitions:
 
 | Key | Type | Default | Purpose |
 |---|---|---|---|
-| `connectTimeout` | duration | `10s` | Maximum time to wait for the upstream TCP connect to complete, for both the bootstrap connection and per-broker connections to this cluster |
+| `connectTimeout` | duration | `30s` (Netty's default, applied when the key is unset) | Maximum time to wait for the upstream TCP connect to complete, for both the bootstrap connection and per-broker connections to this cluster |
 
 `connectTimeout` is a provisional name; a clearer one is welcome if reviewers have a better
 suggestion.
@@ -161,24 +166,21 @@ is scheduled to disappear in the same release means adding something that is imm
 again, and gives users configuring `targetCluster` today one more reason to put off migrating to
 `clusterDefinitions` rather than one less.
 
-This follows the shape of an existing, still-open gap: #4840 notes that `ClusterDefinition` has no
-equivalent of `TargetCluster`'s `bootstrapServerSelection` YAML key, backed by the `selectionStrategy`
-record component (`TargetCluster.java`). `ClusterDefinition#toTargetCluster()`
-(`ClusterDefinition.java`) only ever calls the
-two-argument `TargetCluster` constructor, so a `ClusterDefinition` has no way to set a non-default
-selection strategy. A candidate fix is up as PR #4800, unmerged at time of writing. That change is
-the same shape as this one — a new component added to `ClusterDefinition` and threaded through
-`toTargetCluster()` — so it is precedent for the approach here rather than a dependency on it. This
-is separate, ongoing work tracked under #4840.
+This follows the precedent set by #4840 (PR #4891): a nullable component added to
+`ClusterDefinition` and threaded through the three-argument `TargetCluster` constructor in
+`toTargetCluster()` — the same shape of change proposed here for `connectTimeout`. That precedent
+covers the record plumbing only, not validation: a bootstrap selection strategy is an object with
+nothing to validate. The precedent for validating `connectTimeout` is `NettySettings`, covered
+below.
 
 ### Reading the value
 
 `ServerConnectionStateMachine` already holds an `UpstreamClusterModel`, whose first record
 component is the `TargetCluster` for the connection. `configureBootstrap` can read
-`upstreamClusterModel.targetCluster().resolveConnectTimeout()` directly and add:
+`upstreamClusterModel.targetCluster().effectiveConnectTimeout()` directly and add:
 
 ```java
-.option(ChannelOption.CONNECT_TIMEOUT_MILLIS, (int) upstreamClusterModel.targetCluster().resolveConnectTimeout().toMillis())
+.option(ChannelOption.CONNECT_TIMEOUT_MILLIS, (int) upstreamClusterModel.targetCluster().effectiveConnectTimeout().toMillis())
 ```
 
 alongside the existing `AUTO_READ` and `TCP_NODELAY` options. No constructor or method signature
@@ -187,17 +189,20 @@ where it is needed. The alternative of threading it through `ServerConnectionFac
 which already takes ten parameters behind a `@SuppressWarnings("java:S107")`, is avoided.
 
 The `connectTimeout` field on `ClusterDefinition` and `TargetCluster` is `@Nullable`, not a
-non-null `Duration` defaulted at construction. This follows the pattern `TargetCluster` already
-uses for `selectionStrategy` (`TargetCluster.java`): the field carries no default itself, and a
-`resolveConnectTimeout()` method — mirroring the existing `resolveSelectionStrategy()`
-(`TargetCluster.java`), which applies `Objects.requireNonNullElse(selectionStrategy,
+non-null `Duration` defaulted at construction, and only `TargetCluster` resolves it.
+`ClusterDefinition` holds the field and hands it to `TargetCluster`'s constructor via
+`toTargetCluster()`; it has no resolving accessor of its own. This follows the pattern
+`TargetCluster` already uses for `selectionStrategy` (`TargetCluster.java`): the field carries no
+default itself, and an `effectiveConnectTimeout()` method on `TargetCluster` — mirroring the existing
+`effectiveSelectionStrategy()` (`TargetCluster.java`), which applies `Objects.requireNonNullElse(selectionStrategy,
 DEFAULT_SELECTION_STRATEGY)` — supplies the default at read time. `TargetCluster.java` explains
 why the default isn't baked into the field itself: doing so would break fidelity between the
 fluent-API and YAML-deserialized forms, so that a `ClusterDefinition` built in code and one parsed
 from a config file that simply omits `connectTimeout` remain equal and round-trip the same way.
-`resolveSelectionStrategy()` is private because its only callers, `bootstrapServer()` and
-`toString()`, live inside `TargetCluster` itself; `resolveConnectTimeout()` needs to be visible to
-`ServerConnectionStateMachine` in a different package, so it should be public rather than private.
+`effectiveSelectionStrategy()` is already public — it is called from `UpstreamClusterModel`, in a
+different package, as well as from `toString()` inside `TargetCluster` itself — so
+`effectiveConnectTimeout()` needing to be visible to `ServerConnectionStateMachine`, also in a
+different package, follows the same precedent directly rather than diverging from it.
 
 `connectTimeout` should also be validated: negative durations are rejected, following the pattern
 `NettySettings` already applies to its own duration fields. Its compact constructor calls a
@@ -216,29 +221,33 @@ duration whose millisecond value overflows `int` (`Integer.MAX_VALUE` millisecon
 24.8 days) silently wrap into a nonsensical timeout rather than fail at config load; the accepted
 range should be capped well inside that bound.
 
-### Choosing the default
+### Retaining Netty's default
 
-The proposed default is **10 seconds**, down from Netty's 30. This is reasoned from Kafka's own
-client defaults, not measured: none of the measurements above tested a 10-second bound end to end,
-and the figure should be read as an argument from first principles rather than an empirically
-tuned value.
+The default stays at Netty's existing 30 seconds; this proposal changes nothing about it. Keeping
+it makes the change purely additive — no deployment behaves any differently on upgrade until an
+operator explicitly sets `connectTimeout` on a cluster. Deployments that happen to depend on the
+current 30-second bound, including the slow-network and high-latency cases noted in Motivation
+above, keep working exactly as they do today.
 
-The anchor is `socket.connection.setup.timeout.ms`, which Kafka clients default to 10000 before
-escalating to 20000 then to a ceiling of 30000 (`socket.connection.setup.timeout.max.ms`) with ±20%
-jitter on each step. A flat 10-second proxy-side timeout adopts Kafka's *opening* value, not its
-escalation behaviour — deliberately, per Non-goals above. Kafka escalates to give a struggling
-broker more time on successive attempts; the proxy's connect timeout instead guards against an
-address that is not merely struggling but unreachable, where waiting longer on a second attempt
-buys nothing.
+A lower default would risk trading a known, already-survivable problem for a silent regression in
+deployments that work correctly today. A healthy connect can legitimately take longer than 10
+seconds: Linux's default SYN retransmission schedule retries a lost SYN at roughly 1s, 3s, 7s and
+15s after the initial attempt, so a connect that drops four SYNs in a row still succeeds at around
+15 seconds under the current 30-second bound. A 10-second default would abort that connection
+outright, even though nothing about it was actually broken. A broker whose accept backlog is full
+under load produces the same symptom from the client's side — the SYN is queued rather than
+answered, and the connect completes once the broker catches up — and neither case is the blackholed,
+unrecoverable address this proposal is aimed at. The 15-second retransmission in particular is what
+rules out a flat 10-second default: a bound short enough to only clear the 1s and 3s retransmissions
+would abort connections that were always going to succeed.
 
-Ten seconds also leaves room for the TCP stack to attempt more than one SYN before giving up —
-Linux's default SYN retransmission schedule retries at roughly 1s and 3s after the initial attempt
-— so a single lost SYN does not immediately read as a hard failure, while still sitting well clear
-of every client-side bound this proposal has cited (`request.timeout.ms` at 30000 across
-`AdminClientConfig`, `ProducerConfig` and `ConsumerConfig`; `default.api.timeout.ms`/`max.block.ms`
-at 60000). At today's 30-second default the proxy's own timeout and the client's `request.timeout.ms`
-can race, as noted in Motivation; a 10-second default removes that race rather than trying to win
-it.
+None of this makes Kafka's own client defaults irrelevant — they are guidance for an operator
+choosing a value, rather than justification for changing this proposal's default. Kafka's clients
+default `socket.connection.setup.timeout.ms` to 10000, escalating to a ceiling of 30000
+(`socket.connection.setup.timeout.max.ms`) with ±20% jitter on each step. Kafka treats ten seconds
+as a reasonable first attempt before escalating further, which is a sensible starting point for an
+operator who wants to tune `connectTimeout` down from the retained 30-second default — reasoned from
+Kafka's own defaults, not measured against this proxy.
 
 ### Testing
 
@@ -263,7 +272,7 @@ one already in that suite.
 
 - `kroxylicious/kroxylicious` — `ClusterDefinition` and `TargetCluster` in kroxylicious-runtime gain
   the new field; `ServerConnectionStateMachine#configureBootstrap` reads it. Documentation and the
-  changelog need an entry for the new key and the changed effective default.
+  changelog need an entry for the new key.
 
 **Not affected:**
 
@@ -275,35 +284,25 @@ one already in that suite.
 
 ## Compatibility
 
-`connectTimeout` is an additive, optional key on `ClusterDefinition`; existing configurations parse
-unchanged. The *effective* default does change, from Netty's 30 seconds to this proposal's 10, which
-is an observable behaviour change for anyone relying on the old figure, even though nothing in their
-configuration file changes.
-
-The new key is only reachable through `clusterDefinitions` / `ClusterDefinition`, not through the
-deprecated inline `targetCluster` form, so a user still on `targetCluster` gets the new 10-second
-default and cannot override it without migrating to `clusterDefinitions` — which is available
-today, just a change of config shape rather than an added key. That is judged acceptable on the
-assumption that `targetCluster` is removed in the same release this ships in, per #4462's 0.25.0
-milestone; if that removal slips past this proposal's release, the fallback is to either expose
-`connectTimeout` on `targetCluster` after all, or hold the default change until #4462 lands, rather
-than ship a changed default to a config form with no in-place opt-out.
+`connectTimeout` is an additive, optional key on `ClusterDefinition`. Existing configurations parse
+unchanged, and because the default is unchanged, they behave identically too — nothing is
+observable on upgrade unless an operator explicitly sets the key.
 
 ## Future extensions
 
 **Intra-connection failover across the bootstrap list.** Today, a failed connect to one bootstrap
 address is not retried by the proxy itself — the attempt is torn down and it is left to the
 downstream client to reconnect and, via the shared round-robin counter, eventually land on a
-different address. A natural complement to a shorter, configurable timeout is having the proxy try
+different address. A natural complement to a configurable connect timeout is having the proxy try
 the next address in the list itself before giving up, rather than relying on the client's own retry
 behaviour to make progress. This is deferred rather than folded into this proposal because it needs
 design of its own: where the iteration state over the address list would live and how long it
 persists, how it interacts with the configured `BootstrapSelectionStrategy` (round robin today, per
 `TargetCluster#selectionStrategy`), and what happens to the downstream connection while the
 proxy is still working through the list. It is the other half of making bootstrap resilient to a
-partially unavailable list — this proposal shortens the wait per address, that work would reduce how
-many addresses a client has to force the proxy through — and likely warrants its own issue rather
-than an addendum here.
+partially unavailable list — this proposal makes the per-address wait configurable, that work would
+reduce how many addresses a client has to force the proxy through — and likely warrants its own
+issue rather than an addendum here.
 
 ## Rejected alternatives
 
@@ -329,8 +328,15 @@ That model does not map onto the proxy: there is no multi-attempt loop inside
 and any retrying happens above the proxy, in the client's own reconnect logic. A per-attempt timeout
 is the only quantity the proxy actually controls today.
 
-**Leaving the 30-second default and only adding configurability.** Adds control without changing
-behaviour for anyone who does not act on it, and the motivation above shows the current default is
-a source of surprise precisely because nobody previously had reason to look for it. A default that
-requires an operator to already know about the problem to fix it helps only the users who have
-already diagnosed it themselves.
+**Lowering the default below Netty's 30 seconds.** Considered, and rejected on review: existing
+deployments may depend on the current bound in slow-network environments, and some test
+environments need *longer* timeouts than 30 seconds rather than shorter — so a lower default risks
+turning working connections into failures on upgrade, with no configuration change on the affected
+user's part. The asymmetry is the deciding factor: a user hitting a blackholed address today has a
+known, survivable problem — a slow bootstrap, or an outright failure they can already diagnose from
+the client-side exception — and this proposal gives them a knob to fix it; a lower default, by
+contrast, risks a silent regression in deployments that work correctly today, for users who did
+nothing to opt into the change. The mechanism is concrete, not speculative: Linux's SYN
+retransmission schedule (1s, 3s, 7s, 15s) and a broker's accept backlog under load can both
+legitimately push a healthy connect past 10 seconds, as detailed under Retaining Netty's default
+above.
